@@ -80,9 +80,9 @@ class MainActivity : Activity() {
     private val folderRequestCode = 5102
 
     private val prefs by lazy { getSharedPreferences("suno_inspector", MODE_PRIVATE) }
-    private val dataDir: File get() = File(filesDir, "suno")
-    private val libraryFile: File get() = File(dataDir, "library.json")
-    private val downloadedFile: File get() = File(dataDir, "downloaded.txt")
+    private val sunoDir: File get() = File(filesDir, "suno")
+    private val libraryFile: File get() = File(sunoDir, "library.json")
+    private val downloadedFile: File get() = File(sunoDir, "downloaded.txt")
 
     private val uuidRegex =
         Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -333,11 +333,11 @@ class MainActivity : Activity() {
     /** À appeler sous synchronized(lock). */
     private fun persistLibrary() {
         try {
-            dataDir.mkdirs()
+            sunoDir.mkdirs()
             val arr = JSONArray()
             library.values.forEach { arr.put(it) }
             val text = arr.toString()
-            val tmp = File(dataDir, "library.json.tmp")
+            val tmp = File(sunoDir, "library.json.tmp")
             tmp.writeText(text)
             if (!tmp.renameTo(libraryFile)) {
                 libraryFile.writeText(text)
@@ -791,7 +791,7 @@ class MainActivity : Activity() {
         synchronized(lock) {
             downloaded.add(id)
             try {
-                dataDir.mkdirs()
+                sunoDir.mkdirs()
                 downloadedFile.appendText(id + "\n")
             } catch (_: Exception) {
             }
