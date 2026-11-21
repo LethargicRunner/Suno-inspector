@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
+import android.util.Base64
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
@@ -37,7 +38,10 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -68,6 +72,9 @@ class MainActivity : Activity() {
     private val cancelRequested = AtomicBoolean(false)
 
     private var documentStartCapture = false
+
+    @Volatile
+    private var onSunoPage = false
     private var treeUri: Uri? = null
     private var pendingDownloadAfterPick = false
     private var pendingIds: Set<String>? = null
@@ -184,6 +191,7 @@ class MainActivity : Activity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
+                onSunoPage = url != null && url.startsWith("https://") && isSunoHost(Uri.parse(url).host)
                 // Solution de repli si le script de démarrage n'est pas supporté.
                 if (!documentStartCapture && url != null && url.startsWith("https://") &&
                     isSunoHost(Uri.parse(url).host)
@@ -220,6 +228,10 @@ class MainActivity : Activity() {
                     if (sourceOrigin.scheme != "https") return
                     if (!isSunoHost(sourceOrigin.host)) return
                     val data = message.data ?: return
+                    if (data.startsWith("DLC|") || data.startsWith("DLD|") || data.startsWith("DLE|")) {
+                        handleDownloadMessage(data)
+                        return
+                    }
                     ingest(data)
                 }
             }
@@ -254,6 +266,35 @@ class MainActivity : Activity() {
               window.SunoInspector.postMessage(body);
             } catch (e) {}
           }
+
+          function post(msg) {
+            try { if (window.SunoInspector) window.SunoInspector.postMessage(msg); } catch (e) {}
+          }
+
+          // Téléchargement réalisé par la page elle-même (mêmes en-têtes et même réseau que le navigateur).
+          window.__sunoDownload = function (id, url) {
+            fetch(url).catch(function () {
+              return fetch(url, { credentials: 'include' });
+            }).then(function (r) {
+              if (!r.ok) { post('DLE|' + id + '|HTTP ' + r.status); return null; }
+              return r.arrayBuffer();
+            }).then(function (buf) {
+              if (!buf) return;
+              var bytes = new Uint8Array(buf);
+              var CH = 600000;
+              for (var i = 0; i < bytes.length; i += CH) {
+                var sub = bytes.subarray(i, Math.min(i + CH, bytes.length));
+                var bin = '';
+                for (var j = 0; j < sub.length; j += 8192) {
+                  bin += String.fromCharCode.apply(null, sub.subarray(j, Math.min(j + 8192, sub.length)));
+                }
+                post('DLC|' + id + '|' + btoa(bin));
+              }
+              post('DLD|' + id + '|' + bytes.length);
+            }).catch(function (e) {
+              post('DLE|' + id + '|' + e);
+            });
+          };
 
           var originalFetch = window.fetch;
           if (originalFetch) {
@@ -820,13 +861,26 @@ class MainActivity : Activity() {
 
             val errors = ArrayList<String>()
             var ok = false
-            for (u in urls.distinct()) {
+            val candidates = urls.distinct()
+            for (u in candidates) {
                 val err = fetchTo(u, temp)
                 if (err == null) {
                     ok = true
                     break
                 }
                 errors.add(Uri.parse(u).host + ": " + err)
+            }
+            if (!ok) {
+                // Dernier recours : téléchargement fait par la page suno.com elle-même.
+                for (u in candidates.take(2)) {
+                    if (cancelRequested.get()) break
+                    val err = fetchViaPage(id, u, temp)
+                    if (err == null) {
+                        ok = true
+                        break
+                    }
+                    errors.add(err)
+                }
             }
             if (!ok) return errors.joinToString(" | ")
 
@@ -868,7 +922,7 @@ class MainActivity : Activity() {
         return true
     }
 
-    /** Retourne null si OK, sinon le motif de l'échec (ex. "HTTP 403"). */
+    /** Retourne null si OK, sinon le motif de l'échec (ex. "HTTP 403 [cloudflare]"). */
     private fun fetchTo(url: String, dest: File): String? {
         var conn: HttpURLConnection? = null
         try {
@@ -887,10 +941,32 @@ class MainActivity : Activity() {
                 )
                 setRequestProperty("Referer", "https://suno.com/")
                 setRequestProperty("Origin", "https://suno.com")
-                setRequestProperty("Accept", "audio/mpeg,audio/*;q=0.9,*/*;q=0.8")
+                setRequestProperty("Accept", "*/*")
+                setRequestProperty("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")
+                setRequestProperty("Range", "bytes=0-")
+                setRequestProperty("Sec-Fetch-Dest", "audio")
+                setRequestProperty("Sec-Fetch-Mode", "no-cors")
+                setRequestProperty("Sec-Fetch-Site", "cross-site")
+                try {
+                    val cookie = CookieManager.getInstance().getCookie(url)
+                    if (!cookie.isNullOrEmpty()) setRequestProperty("Cookie", cookie)
+                } catch (_: Exception) {
+                }
             }
             val code = conn.responseCode
-            if (code != 200) return "HTTP $code"
+            if (code != 200 && code != 206) {
+                val server = conn.getHeaderField("Server") ?: ""
+                val mitigated = conn.getHeaderField("cf-mitigated") ?: ""
+                val body: String = try {
+                    conn.errorStream?.bufferedReader()?.use { it.readText().take(120) } ?: ""
+                } catch (_: Exception) {
+                    ""
+                }
+                return "HTTP $code" +
+                    (if (server.isNotEmpty()) " [$server]" else "") +
+                    (if (mitigated.isNotEmpty()) " mitigated=$mitigated" else "") +
+                    (if (body.isNotBlank()) " « " + body.replace(Regex("\\s+"), " ").trim() + " »" else "")
+            }
             conn.inputStream.use { input ->
                 dest.outputStream().use { output -> input.copyTo(output) }
             }
@@ -900,6 +976,62 @@ class MainActivity : Activity() {
             return e.javaClass.simpleName + " " + (e.message ?: "")
         } finally {
             conn?.disconnect()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Téléchargement réalisé par la page suno.com (dernier recours)
+    // ------------------------------------------------------------------
+
+    private class JsDownload(val file: File) {
+        val latch = CountDownLatch(1)
+
+        @Volatile
+        var error: String? = null
+    }
+
+    private val jsDownloads = ConcurrentHashMap<String, JsDownload>()
+
+    private fun handleDownloadMessage(data: String) {
+        val parts = data.split("|", limit = 3)
+        if (parts.size < 3) return
+        val kind = parts[0]
+        val id = parts[1]
+        val payload = parts[2]
+        val job = jsDownloads[id] ?: return
+        // Même exécuteur que le reste : l'ordre des morceaux de fichier est conservé.
+        ioExecutor.execute {
+            try {
+                when (kind) {
+                    "DLC" -> job.file.appendBytes(Base64.decode(payload, Base64.DEFAULT))
+                    "DLD" -> job.latch.countDown()
+                    "DLE" -> {
+                        job.error = payload
+                        job.latch.countDown()
+                    }
+                }
+            } catch (e: Exception) {
+                job.error = "écriture : " + (e.message ?: "")
+                job.latch.countDown()
+            }
+        }
+    }
+
+    private fun fetchViaPage(id: String, url: String, dest: File): String? {
+        if (!onSunoPage) return "page : ouvre une page suno.com dans l'app"
+        val job = JsDownload(dest)
+        dest.delete()
+        jsDownloads[id] = job
+        try {
+            val js = "window.__sunoDownload(" + JSONObject.quote(id) + "," + JSONObject.quote(url) + ");"
+            runOnUiThread { webView.evaluateJavascript(js, null) }
+            if (!job.latch.await(120, TimeUnit.SECONDS)) return "page : délai dépassé"
+            val err = job.error
+            if (err != null) return "page : $err"
+            val size = dest.length()
+            return if (size > 1024) null else "page : fichier trop petit ($size o)"
+        } finally {
+            jsDownloads.remove(id)
         }
     }
 
